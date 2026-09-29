@@ -29,6 +29,7 @@ IMAGE=$(grep -oP '^DEFAULT_IMAGE=\K\S+' "$REPO/bin/limo-jazzy-run")
 
 echo "== Docker"
 if ! command -v docker >/dev/null; then
+  apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
 fi
 systemctl enable -q --now docker
