@@ -1,0 +1,6 @@
+# Groups the limo-jazzy@<component> units: stopping this target stops all of them.
+[Unit]
+Description=Limo ROS 2 Jazzy stack
+
+[Install]
+WantedBy=multi-user.target

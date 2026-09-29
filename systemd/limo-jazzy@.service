@@ -1,0 +1,21 @@
+# One component of the Limo Jazzy stack (%i = base, lidar, camera, ..., bridge).
+# Managed with `limo-jazzy`; @USER@ is filled in by install.sh.
+[Unit]
+Description=Limo ROS 2 Jazzy: %i
+PartOf=limo-jazzy.target
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=@USER@
+EnvironmentFile=/etc/limo-jazzy/limo-jazzy.env
+ExecStart=/usr/local/lib/limo-jazzy/limo-jazzy-run %i
+ExecStopPost=-/bin/sh -c 'docker rm -f "$(/usr/local/lib/limo-jazzy/limo-jazzy-run --name %i)" >/dev/null 2>&1 || true'
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=limo-jazzy.target

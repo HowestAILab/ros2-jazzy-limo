@@ -1,0 +1,10 @@
+# slam_toolbox settings for the Limo's YDLidar. Frames and topics are set by slam.launch.py.
+slam_toolbox:
+  ros__parameters:
+    resolution: 0.05
+    max_laser_range: 12.0          # ydlidar.yaml range_max
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    map_update_interval: 2.0
+    transform_publish_period: 0.02
+    transform_timeout: 0.2

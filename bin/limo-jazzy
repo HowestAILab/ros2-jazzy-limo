@@ -1,0 +1,115 @@
+#!/bin/bash
+# Controls the Limo ROS 2 Jazzy stack (containers run as limo-jazzy@<component> units).
+#
+#   sudo limo-jazzy start [--bridge|--no-bridge] [component...]
+#   sudo limo-jazzy stop [component...]
+#   sudo limo-jazzy restart [--bridge|--no-bridge]
+#   sudo limo-jazzy enable [--bridge|--no-bridge]   start at boot (LIMO_COMPONENTS)
+#   sudo limo-jazzy disable                         don't start at boot
+#   limo-jazzy status
+#   limo-jazzy logs <component> [-f]
+#   limo-jazzy ros2 <args...>                       e.g. limo-jazzy ros2 topic list
+#   limo-jazzy shell                                interactive Jazzy shell
+#   limo-jazzy dds                                  show the effective DDS config
+#
+# Without component names, start uses LIMO_COMPONENTS from the config. The foxglove_bridge
+# follows LIMO_FOXGLOVE_BRIDGE unless --bridge or --no-bridge is given.
+set -euo pipefail
+
+CONFIG=${LIMO_JAZZY_CONFIG:-/etc/limo-jazzy/limo-jazzy.env}
+RUN=/usr/local/lib/limo-jazzy/limo-jazzy-run
+ALL=(base lidar camera compressor description mapping localization bridge)
+
+[ -r "$CONFIG" ] || { echo "config $CONFIG missing; run install.sh first" >&2; exit 1; }
+set -a; source "$CONFIG"; set +a
+
+usage() { sed -n '4,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+need_root() { [ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }; }
+unit() { echo "limo-jazzy@$1.service"; }
+is_true() { [[ ${1,,} =~ ^(1|true|yes|on)$ ]]; }
+
+# selection [--bridge|--no-bridge] [component...] -> prints the components to run
+selection() {
+  local bridge=${LIMO_FOXGLOVE_BRIDGE:-true} list=()
+  for a in "$@"; do
+    case $a in
+      --bridge) bridge=true ;;
+      --no-bridge) bridge=false ;;
+      -*) usage ;;
+      *) list+=("$a") ;;
+    esac
+  done
+  [ ${#list[@]} -gt 0 ] || read -ra list <<< "${LIMO_COMPONENTS:-}"
+  if is_true "$bridge"; then list+=(bridge); else list=("${list[@]/bridge}"); fi
+  if [[ " ${list[*]} " == *" mapping "* && " ${list[*]} " == *" localization "* ]]; then
+    echo "mapping and localization can't run at the same time" >&2; exit 1
+  fi
+  for c in "${list[@]}"; do
+    [ -n "$c" ] || continue
+    [[ " ${ALL[*]} " == *" $c "* ]] || { echo "unknown component: $c (known: ${ALL[*]})" >&2; exit 1; }
+    echo "$c"
+  done | awk '!seen[$0]++'
+}
+
+status() {
+  printf '%-13s %-9s %-9s %s\n' COMPONENT BOOT STATE CONTAINER
+  for c in "${ALL[@]}"; do
+    printf '%-13s %-9s %-9s %s\n' "$c" \
+      "$(systemctl is-enabled "$(unit "$c")" 2>/dev/null || true)" \
+      "$(systemctl is-active "$(unit "$c")" 2>/dev/null || true)" \
+      "$($RUN --name "$c")"
+  done
+  echo
+  echo "namespace /${LIMO_NAMESPACE:-limo}, domain ${ROS_DOMAIN_ID:-0}, peers: ${LIMO_DDS_PEERS:-none}"
+}
+
+stop() {
+  local list=("$@"); [ ${#list[@]} -gt 0 ] || list=("${ALL[@]}")
+  local units=(); for c in "${list[@]}"; do units+=("$(unit "$c")"); done
+  systemctl stop "${units[@]}" 2>/dev/null || true
+}
+
+start() {
+  local out; out=$(selection "$@")
+  local sel=(); [ -n "$out" ] && mapfile -t sel <<< "$out"
+  [ ${#sel[@]} -gt 0 ] || { echo "nothing to start (LIMO_COMPONENTS is empty)" >&2; exit 1; }
+  # Stop what isn't selected, so --no-bridge also stops a running bridge.
+  local others=(); for c in "${ALL[@]}"; do [[ " ${sel[*]} " == *" $c "* ]] || others+=("$c"); done
+  [ ${#others[@]} -gt 0 ] && stop "${others[@]}"
+  local units=(); for c in "${sel[@]}"; do units+=("$(unit "$c")"); done
+  systemctl start "${units[@]}"
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  start)   need_root; start "$@"; status ;;
+  stop)    need_root; stop "$@"; status ;;
+  restart) need_root; stop; start "$@"; status ;;
+  enable)
+    need_root
+    out=$(selection "$@")
+    sel=(); [ -n "$out" ] && mapfile -t sel <<< "$out"
+    systemctl enable -q limo-jazzy.target
+    for c in "${ALL[@]}"; do
+      if [[ " ${sel[*]} " == *" $c "* ]]; then systemctl enable -q "$(unit "$c")"
+      else systemctl disable -q "$(unit "$c")" 2>/dev/null || true; fi
+    done
+    status ;;
+  disable)
+    need_root
+    systemctl disable -q limo-jazzy.target
+    for c in "${ALL[@]}"; do systemctl disable -q "$(unit "$c")" 2>/dev/null || true; done
+    status ;;
+  status)  status ;;
+  logs)    [ $# -ge 1 ] || usage; c=$1; shift; exec journalctl -u "$(unit "$c")" "$@" ;;
+  dds)     $RUN --dds-xml | sed 's/></>\n</g' ;;
+  shell)   exec $RUN shell "$@" ;;
+  ros2)
+    # Reuse a running container when there is one; otherwise start a short-lived shell.
+    target=$(docker ps --format '{{.Names}}' --filter "name=^ros2-jazzy-${ROS_DOMAIN_ID:-0}-limo-" 2>/dev/null | head -1 || true)
+    if [ -n "$target" ]; then
+      exec docker exec -i "$target" /usr/local/bin/limo-entrypoint ros2 "$@"
+    fi
+    exec $RUN shell ros2 "$@" ;;
+  *) usage ;;
+esac

@@ -1,0 +1,89 @@
+#!/bin/bash
+# Runs one component of the Limo stack in the ros2-jazzy-limo container, in the
+# foreground. Used by limo-jazzy@<component>.service; `limo-jazzy` wraps it for humans.
+#   limo-jazzy-run <component>      base lidar camera compressor description
+#                                   mapping localization bridge shell
+#   limo-jazzy-run --dds-xml        print the generated CycloneDDS config
+#   limo-jazzy-run --name <component>  print the component's container name
+set -euo pipefail
+
+CONFIG=${LIMO_JAZZY_CONFIG:-/etc/limo-jazzy/limo-jazzy.env}
+DEFAULT_IMAGE=ros2-jazzy-limo:20260929
+MAP_DIR=/var/lib/limo-jazzy/maps
+
+# Group membership may be newer than the login session; re-exec through sg. sg runs its
+# command via /bin/sh, so the bash-quoted argv is handed over as base64.
+if [ "$(id -u)" -ne 0 ] && ! id -nG | grep -qw docker && getent group docker | grep -qw "$(id -un)"; then
+  cmd=$(printf '%q ' "$0" "$@" | base64 -w0)
+  exec sg docker -c "exec bash -c \"\$(echo $cmd | base64 -d)\""
+fi
+
+# systemd already loaded the config (EnvironmentFile); load it for manual runs too.
+if [ -z "${LIMO_NAMESPACE:-}" ] && [ -r "$CONFIG" ]; then
+  set -a; source "$CONFIG"; set +a
+fi
+NS=${LIMO_NAMESPACE:-limo}
+NS=${NS#/}
+DOMAIN=${ROS_DOMAIN_ID:-0}
+IMAGE=${LIMO_JAZZY_IMAGE:-$DEFAULT_IMAGE}
+
+dds_xml() {
+  if [ -n "${LIMO_CYCLONEDDS_URI:-}" ]; then
+    printf '%s' "$LIMO_CYCLONEDDS_URI"; return
+  fi
+  local peers="" p
+  for p in ${LIMO_DDS_PEERS:-}; do peers+="<Peer Address=\"$p\"/>"; done
+  local iface=""
+  [ -n "${LIMO_DDS_INTERFACE:-}" ] && iface="<Interfaces><NetworkInterface name=\"$LIMO_DDS_INTERFACE\"/></Interfaces>"
+  printf '%s' "<CycloneDDS><Domain Id=\"any\"><General>$iface<AllowMulticast>${LIMO_DDS_MULTICAST:-spdp}</AllowMulticast></General><Discovery><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>120</MaxAutoParticipantIndex><Peers>$peers</Peers></Discovery></Domain></CycloneDDS>"
+}
+
+container_name() {  # lab convention: ros2-jazzy-<domain>-<project>[-<component>]-<bridge|node>
+  case $1 in
+    bridge) echo "ros2-jazzy-$DOMAIN-limo-bridge" ;;
+    shell)  echo "ros2-jazzy-$DOMAIN-limo-shell$$-node" ;;
+    *)      echo "ros2-jazzy-$DOMAIN-limo-$1-node" ;;
+  esac
+}
+
+if [ "${1:-}" = --dds-xml ]; then dds_xml; echo; exit 0; fi
+if [ "${1:-}" = --name ]; then container_name "$2"; exit 0; fi
+[ $# -ge 1 ] || { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+component=$1; shift
+
+hardware=0
+case $component in
+  base)         hardware=1; cmd=(ros2 launch limo_jazzy_bringup base.launch.py) ;;
+  lidar)        hardware=1; cmd=(ros2 launch limo_jazzy_bringup lidar.launch.py) ;;
+  camera)       hardware=1; cmd=(ros2 launch limo_jazzy_bringup camera.launch.py) ;;
+  description)  cmd=(ros2 launch limo_jazzy_bringup description.launch.py) ;;
+  compressor)   cmd=(ros2 run image_transport republish raw compressed --ros-args
+                     -r "in:=/$NS/limo_camera/color/image_raw"
+                     -r "out/compressed:=/$NS/limo_camera/color/image/compressed") ;;
+  mapping)      cmd=(ros2 launch limo_jazzy_bringup slam.launch.py mode:=mapping) ;;
+  localization) cmd=(ros2 launch limo_jazzy_bringup slam.launch.py mode:=localization) ;;
+  bridge)       cmd=(ros2 launch foxglove_bridge foxglove_bridge_launch.xml "port:=${LIMO_FOXGLOVE_PORT:-8765}") ;;
+  shell)        cmd=("${@:-bash}"); set -- ;;
+  *) echo "unknown component: $component" >&2; exit 2 ;;
+esac
+
+name=$(container_name "$component")
+
+args=(--rm --init --name "$name" --network host --ipc host
+      --user "$(id -u):$(id -g)"
+      -e ROS_DOMAIN_ID="$DOMAIN" -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      -e CYCLONEDDS_URI="$(dds_xml)" -e HOME=/tmp -e USER=limo -e LOGNAME=limo
+      -v /etc/limo-jazzy:/etc/limo-jazzy:ro)
+while IFS='=' read -r key _; do args+=(-e "$key"); done < <(env | grep -E '^LIMO_[A-Z0-9_]*=' || true)
+[ -d "$MAP_DIR" ] && args+=(-v "$MAP_DIR:$MAP_DIR")
+if [ $hardware = 1 ]; then
+  # Serial ports and the USB camera; udev symlinks like /dev/ydlidar live on the host.
+  args+=(--privileged -v /dev:/dev)
+  for g in dialout video plugdev; do
+    gid=$(getent group $g | cut -d: -f3) && [ -n "$gid" ] && args+=(--group-add "$gid")
+  done
+fi
+[ -t 0 ] && [ -t 1 ] && args+=(-it)
+
+docker rm -f "$name" >/dev/null 2>&1 || true
+exec docker run "${args[@]}" "$IMAGE" "${cmd[@]}" "$@"
